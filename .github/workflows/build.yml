@@ -1,0 +1,90 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install PySide6 pyinstaller imageio-ffmpeg
+
+      - name: Syntax guard (fail on any .py syntax error)
+        # PyInstaller SILENTLY SKIPS modules with syntax errors (build stays
+        # green, module missing from the bundle). This guard stops that class
+        # of bug. Lesson carried over from the PhantomDola build.
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import py_compile, glob
+          files = glob.glob('auto_editor/**/*.py', recursive=True) + ['autoeditor.py']
+          assert files, "no python files found"
+          for f in files:
+              py_compile.compile(f, doraise=True)
+          print("py_compile OK:", len(files), "files")
+          EOF
+
+      - name: Bundle ffmpeg (imageio-ffmpeg exe -> ffmpeg-bin/)
+        shell: bash
+        run: |
+          mkdir -p ffmpeg-bin
+          python - <<'EOF'
+          import imageio_ffmpeg, shutil, os
+          src = imageio_ffmpeg.get_ffmpeg_exe()
+          dst = os.path.join("ffmpeg-bin", "ffmpeg.exe")
+          shutil.copyfile(src, dst)
+          print("ffmpeg bundled:", dst, os.path.getsize(dst), "bytes")
+          EOF
+
+      - name: PyInstaller onefile build
+        # NOTE: entry is autoeditor.py (repo-root launcher), NOT
+        # auto_editor/app.py. app.py uses relative imports throughout, and a
+        # PyInstaller entry script runs as __main__ with no parent package —
+        # pointing the build at app.py directly would crash the shipped EXE
+        # at startup ("attempted relative import with no known parent
+        # package"). The launcher imports auto_editor.app properly, so the
+        # frozen bundle resolves every relative import.
+        shell: bash
+        run: |
+          pyinstaller --onefile --windowed --name AutoEditor \
+            --add-binary "ffmpeg-bin/ffmpeg.exe;ffmpeg-bin" \
+            --add-data "assets;assets" \
+            autoeditor.py
+
+      - name: Smoke test (headless import check)
+        # python -m keeps the auto_editor package context so the relative
+        # imports in app.py resolve; `python auto_editor/app.py --smoke`
+        # would fail with "attempted relative import with no known parent
+        # package" even though the code is fine.
+        # NOTE: auto_editor.smoke (not app --smoke) is used because app.py
+        # imports QtWidgets at module level, which needs display libs that
+        # a bare CI/container may lack. smoke.py covers the headless core:
+        # models, contract round-trip, worker/ai/pipeline imports.
+        shell: bash
+        run: |
+          python -m auto_editor.smoke
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoEditor-windows
+          path: dist/AutoEditor.exe
+          if-no-files-found: error
+
+      - name: GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/AutoEditor.exe
+          body: "AutoEditor Windows build — sirf EXE chalao, Python install nahi chahiye."
