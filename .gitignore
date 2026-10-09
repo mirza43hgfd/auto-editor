@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+tests/out*/
+tests/test_media/
+tests/integ_media/
+*.mp4
+*.mp3
+*.png
+!assets/**/*.png
