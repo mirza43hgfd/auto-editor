@@ -1,0 +1,7 @@
+# Auto-Editor runtime requirements
+PySide6>=6.6
+PySide6-WebEngine>=6.6
+
+# Build-only (GitHub Actions installs these too):
+# pyinstaller
+# imageio-ffmpeg
