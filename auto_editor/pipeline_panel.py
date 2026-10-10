@@ -38,7 +38,8 @@ from . import voiceover_studio as vs
 from .ai_helper import AIError
 from .jobs import JobStore, JobPaused, record_stage_error, raise_if_paused
 from .timeline import Project, Slot
-from .auto_pipeline import MOTION_CYCLE, auto_place_sfx
+from .auto_pipeline import auto_place_sfx
+from .editing import apply_editing_decisions
 
 
 class StageWorker(QThread):
@@ -488,8 +489,9 @@ class PipelinePanel(QWidget):
         for i, (s, ph) in enumerate(zip(slots, photos)):
             project.add_slot(Slot(
                 s["start_sec"], s["end_sec"], visual_path=ph["path"],
-                visual_type="photo", motion_preset=MOTION_CYCLE[i % len(MOTION_CYCLE)],
-                transition="xfade", prompt=ph["prompt"], label=s["label"]))
+                visual_type="photo", prompt=ph["prompt"], label=s["label"]))
+        # Intelligent editing decisions (no fixed preset cycling — brief §6)
+        apply_editing_decisions(project)
         sfx_dir = os.path.normpath(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "..", "assets", "sfx"))
         n = auto_place_sfx(project, script, sfx_dir)
