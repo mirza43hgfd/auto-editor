@@ -1,0 +1,24 @@
+You are a senior video-tooling engineer. Review these two design sketches for a PySide6 documentary auto-editor (Python 3.12, Windows target, ffmpeg backend). Be brief and concrete: real issues + fixes only, no fluff.
+
+PART A — RENDER WORKER (headless function render_project):
+- Video segments: photo = `-loop 1 -framerate 30 -t DUR -i img` then `scale=3840:-1,zoompan=z=EXPR:d=1:x=EXPR:y=EXPR:s=1920x1080:fps=30` with frame count N=DUR*30 baked into expressions (zoom-in: z 1.0->1.15; pan-left: z=1.2, x sweeps). Clip = `-ss IN -t DUR -i clip` + scale/pad to 1920x1080, fps=30.
+- Transitions: xfade chain between consecutive segments, offset=cumulative_dur - 1.0 (1s fade). If all cuts: concat demuxer.
+- Logo: `-loop 1 -i logo.png` overlay at W-w-20:20, logo pre-scaled to width 180, full duration.
+- Audio single pass at end: narration track as-is; BGM `-stream_loop -1` through `sidechaincompress=threshold=0.02:ratio=8:attack=200:release=500` keyed by narration; SFX events via adelay+amix; then `amix=inputs=3:duration=first`, `loudnorm=I=-16:TP=-1.5:LRA=11` single-pass.
+- Restart-safe: visuals split into ~60s chunks, each chunk rendered to chunks/chunk_NNN.mp4 + manifest.json; resume skips done chunks; concat video chunks with re-encode (concat filter), then mux the full-length audio.
+Q1: Is zoompan d=1 with -loop 1 input the correct smooth pattern? Jitter pitfalls?
+Q2: xfade chain offset math — correct? Any gotcha with 1s fades?
+Q3: Chunk(video-only)+manifest then concat re-encode + single audio pass: sound strategy? Better alternative?
+Q4: sidechaincompress params sane for voice-over ducking?
+
+PART B — AUTO PIPELINE (auto_pipeline.py, user's own Gemini API key):
+1. transcribe_audio(mp3): Gemini generateContent with audio bytes -> full transcript text.
+2. Transcript -> Gemini -> slot boundaries JSON [{start_sec,end_sec,text}], cross-checked with ffmpeg silencedetect.
+3. Per slot text -> Gemini -> cinematic 16:9 visual prompt (no text in image).
+4. Prompts -> Gemini image generation (gemini-2.5-flash-image via generateContent) -> PNGs saved to media bin.
+5. Keyword match on transcript (sword/talwar, horse/ghora, crowd/bheer, wind/hawa, drum/dhol...) -> auto-place SFX from built-in library.
+6. Render with auto defaults (Ken Burns, xfades, grade preset, logo, ducked BGM). Result opens in timeline for manual override.
+Q5: Correct Gemini model/method names for audio transcription and image generation via generateContent? Any API gotchas (audio size limits, image aspect control)?
+Q6: PyInstaller onefile on Windows bundling PySide6 + imageio-ffmpeg's ffmpeg exe: recommended pattern (datas vs binaries, onefile vs onedir for startup time)?
+
+Keep total reply under 400 words.

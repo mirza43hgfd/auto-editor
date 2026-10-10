@@ -1,5 +1,25 @@
 # AutoEditor CHANGELOG
 
+## v2.0.1 (2026-10-10) — Hotfix: startup crash + CI regression gates
+
+- **What:** Fixed v2.0 startup crash (`ImportError: cannot import name
+  'MOTION_CYCLE' from 'auto_editor.auto_pipeline'`). M5 deleted the banned
+  fixed-rotation `MOTION_CYCLE` but missed its import + one use in
+  `pipeline_panel._stage_assemble` — the Full Auto assemble path was still
+  cycling presets. Now assemble builds slots with defaults and calls
+  `apply_editing_decisions(project)` (intelligent, content-derived).
+- **Files:** `auto_editor/pipeline_panel.py`, `auto_editor/smoke_gui.py` (new),
+  `tests/test_imports.py` (new), `.github/workflows/build.yml`,
+  `auto_editor/__init__.py` (2.0.1).
+- **Regression gates (would have caught the v2.0 crash):**
+  - `python -m auto_editor.smoke_gui` — imports every Qt-bearing module on the
+    Windows runner (offscreen); new CI step in build.yml.
+  - `tests/test_imports.py` — Qt-free static AST check that every
+    intra-package `from .mod import name` resolves; proven to fail on the
+    pre-fix file with the exact ImportError and pass after.
+- **Test evidence:** full Qt-free suite green (see v2.0.0 entry), plus the two
+  new gates above.
+
 ## v2.0.0 (2026-10-10) — Milestones M1–M7 merged to master
 
 Premium desktop AI video editor: script → coherent, captioned, graded 1080p MP4
