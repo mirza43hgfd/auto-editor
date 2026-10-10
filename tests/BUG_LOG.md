@@ -259,3 +259,10 @@ with repro steps, never edited by WS4.
 - **Root cause:** pause metadata (resume_hint, error category) discarded at the ai_helper boundary.
 - **Fix:** the raised AIError now carries `.paused=True`, `.resume_hint`, `.error_category`; `jobs.classify_error()` checks the attribute first, then falls back to sniffing the (stable, codebase-owned) AllKeysExhausted message markers since most callers stringify AIError.
 - **Retest:** tests/test_jobs.py "classify: paused attribute" + "exhausted: paused not failed" — PASS.
+
+## BUG-027 (2026-10-10) — v2.0 EXE startup crash: stale MOTION_CYCLE import [FIXED]
+- **Symptom:** User's screenshot on Windows: `ImportError: cannot import name 'MOTION_CYCLE' from 'auto_editor.auto_pipeline'` at `pipeline_panel.py` line 41 — app died before the window opened.
+- **Root cause:** M5 deleted the banned fixed-rotation `MOTION_CYCLE` from auto_pipeline.py but missed (a) its import in pipeline_panel.py:41 and (b) its use in `PipelinePanel._stage_assemble` (line 491: `motion_preset=MOTION_CYCLE[i % len(MOTION_CYCLE)]`) — the Full Auto assemble path was still cycling presets, the exact pattern brief §6 bans. The headless smoke test never imported the Qt-bearing modules, so CI stayed green.
+- **Fix:** Removed the import; assemble now builds slots with defaults then calls `apply_editing_decisions(project)` (intelligent, content-derived). Added two regression gates: `auto_editor/smoke_gui.py` (imports all Qt modules; new Windows CI step) and `tests/test_imports.py` (Qt-free static AST check of intra-package imports). Proven: test_imports FAILS on the pre-fix file with the exact ImportError, PASSES after.
+- **Also caught by the new gate:** none stale besides this (one false positive for try/except-defined `WEBENGINE_AVAILABLE` — test refined to scan top-level try/if bodies).
+- **Retest:** full Qt-free suite green (333 checks + run_test.py ALL PASSED).
