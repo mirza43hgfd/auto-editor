@@ -22,6 +22,11 @@ from auto_editor import ai_helper
 from auto_editor import voiceover_studio as vs
 from auto_editor import settings_store
 
+# Isolate the prompt cache per test run: tests must never read the user's
+# real cache (stale hits would break the mocked assertions below).
+import tempfile as _tempfile
+ai_helper.configure_cache(os.path.join(_tempfile.mkdtemp(), "test_cache.sqlite3"))
+
 OUT = os.path.join(HERE, "out_ai")
 os.makedirs(OUT, exist_ok=True)
 
