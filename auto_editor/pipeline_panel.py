@@ -24,6 +24,7 @@ Threading rules (hardened):
 """
 
 import os
+import threading
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QPushButton,
@@ -34,6 +35,8 @@ from PySide6.QtGui import QDesktopServices
 
 from . import settings_store, ai_helper
 from . import voiceover_studio as vs
+from .ai_helper import AIError
+from .jobs import JobStore, JobPaused, record_stage_error, raise_if_paused
 from .timeline import Project, Slot
 from .auto_pipeline import MOTION_CYCLE, auto_place_sfx
 
@@ -58,7 +61,9 @@ class StageWorker(QThread):
             res = self.fn(self.tick.emit, *self.args)
             self.done.emit(True, (self.run_seq, res))
         except Exception as e:
-            self.done.emit(False, (self.run_seq, str(e)[:500]))
+            # M7: emit the exception OBJECT (not str) so _stage_done can
+            # tell JobPaused apart from a real failure.
+            self.done.emit(False, (self.run_seq, e))
 
 
 STAGES = ["voiceover", "slots", "reference", "photos", "assemble", "render"]
@@ -84,6 +89,8 @@ class PipelinePanel(QWidget):
         self._busy = False       # a stage worker is running
         self._run_seq = 0        # generation counter for stale-result guard
         self._worker = None
+        self._job = None         # M7: jobs.JobStore for the active work dir
+        self._pause_event = threading.Event()  # M7: set by Pause button
         self._build()
         self._refresh_buttons()
 
@@ -153,15 +160,21 @@ class PipelinePanel(QWidget):
             lay.addWidget(wrap)
             btn.clicked.connect(lambda _=False, s=st: self._run_stage(s))
             approve.clicked.connect(lambda _=False, s=st: self._approve(s))
-            regen.clicked.connect(lambda _=False, s=st: self._run_stage(s))
+            regen.clicked.connect(lambda _=False, s=st: self._run_stage(s, regen=True))
             self.rows[st] = {"btn": btn, "status": status,
                              "approve": approve, "regen": regen}
 
-        # preview tone button
+        # preview tone button + M7 pause button
         prow = QHBoxLayout()
         self.btn_preview = QPushButton("Preview tone (pehla chunk suno)")
         self.btn_preview.clicked.connect(self._preview_tone)
         prow.addWidget(self.btn_preview)
+        self.btn_pause = QPushButton("⏸ Pause")
+        self.btn_pause.setMaximumWidth(90)
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.setToolTip("Current unit ke baad stage rukega — progress mehfooz rahegi.")
+        self.btn_pause.clicked.connect(self._pause_stage)
+        prow.addWidget(self.btn_pause)
         prow.addStretch(1)
         lay.addLayout(prow)
 
@@ -205,6 +218,15 @@ class PipelinePanel(QWidget):
             self.rows[st]["btn"].setEnabled(enabled)
             self.rows[st]["regen"].setEnabled(enabled)
         self.btn_preview.setEnabled(enabled)
+        self.btn_pause.setEnabled(not enabled and self._busy)
+
+    def _stage_button_label(self, st):
+        """'Resume' when the manifest holds paused/failed progress, else 'Start'."""
+        j = self._job
+        if j is not None and j.job_status in ("paused", "failed") \
+                and j.stage_status(st) in ("paused", "failed", "running"):
+            return "Resume"
+        return "Start"
 
     def _refresh_buttons(self):
         order = STAGES
@@ -214,10 +236,12 @@ class PipelinePanel(QWidget):
             # Start: only when previous stage approved, not approved itself,
             # and nothing running. Approve/Regen visible only with a fresh result.
             self.rows[st]["btn"].setEnabled(can and not locked and not self._busy)
+            self.rows[st]["btn"].setText(self._stage_button_label(st))
             has_result = st in self.state and st not in self.approved
             self.rows[st]["approve"].setVisible(has_result)
             self.rows[st]["regen"].setVisible(has_result and not self._busy)
         self.btn_preview.setEnabled(not self._busy)
+        self.btn_pause.setEnabled(self._busy)
 
     # -- stage flow -----------------------------------------------------------
     def _invalidate_from(self, idx):
@@ -227,7 +251,25 @@ class PipelinePanel(QWidget):
             self.approved.discard(st)
             self._set_status(st, "—")
 
-    def _run_stage(self, st):
+    def _pause_stage(self):
+        """M7: request pause — the worker stops after the current unit."""
+        if not self._busy:
+            return
+        self._pause_event.set()
+        self.btn_pause.setEnabled(False)
+        self.log.emit("Pause manga — current unit ke baad rukega, progress mehfooz rahegi.")
+
+    def _remember_work_dir(self, work):
+        """M7: recent work dirs for crash-recovery scan (settings_store)."""
+        try:
+            recent = settings_store.get("recent_work_dirs", []) or []
+            recent = [d for d in recent if d and d != work]
+            recent.insert(0, work)
+            settings_store.set("recent_work_dirs", recent[:8])
+        except Exception:
+            pass
+
+    def _run_stage(self, st, regen=False):
         if self._busy:
             self.log.emit("Ek stage pehle se chal raha hai — ruko.")
             return
@@ -237,6 +279,18 @@ class PipelinePanel(QWidget):
         idx = STAGES.index(st)
         # a fresh run of an earlier stage invalidates everything from it on
         self._invalidate_from(idx)
+
+        # M7: manifest for this work dir (resume continues from checkpoints).
+        self._job = JobStore(snap["work"])
+        self._remember_work_dir(snap["work"])
+        self._pause_event.clear()
+        if regen:
+            # Explicit Regenerate = true redo: reset this stage onward in
+            # the manifest (checkpoints dropped). A plain Start NEVER
+            # resets — after a crash it rebuilds panel state from the
+            # manifest without spending a single API call.
+            for s2 in STAGES[idx:]:
+                self._job.reset_stage(s2)
 
         # previous-stage results are passed as plain snapshot args
         # (worker thread must never touch widgets/panel state)
@@ -250,7 +304,13 @@ class PipelinePanel(QWidget):
         self._busy = True
         self._run_seq += 1
         seq = self._run_seq
-        self._set_status(st, "Chal raha hai…")
+        # M7: honest manifest-backed progress on (re)start.
+        summ = self._job.job_summary().get(st, {})
+        if summ.get("total"):
+            self._set_status(st, "%s: %d/%d pehle se tayar — jari…"
+                             % (STAGE_TITLES[st], summ["done"], summ["total"]))
+        else:
+            self._set_status(st, "Chal raha hai…")
         self._set_all_buttons_enabled(False)
         self.bar.show()
         fn = getattr(self, "_stage_" + st)
@@ -263,20 +323,21 @@ class PipelinePanel(QWidget):
 
     def _stage_args(self, st, snap):
         """Snapshot arguments for each stage (GUI thread)."""
+        job, pe = self._job, self._pause_event
         if st == "voiceover":
-            return (snap["script"], snap["tone"], snap["work"])
+            return (snap["script"], snap["tone"], snap["work"], job, pe)
         if st == "slots":
             return (self.state["voiceover"],)
         if st == "reference":
-            return (snap["brief"], snap["work"])
+            return (snap["brief"], snap["work"], job, pe)
         if st == "photos":
             return (self.state["slots"], self.state.get("reference", ""),
-                    snap["work"])
+                    snap["work"], job, pe)
         if st == "assemble":
             return (snap["script"], snap["tone"], self.state["voiceover"],
-                    self.state["slots"], self.state["photos"])
+                    self.state["slots"], self.state["photos"], job)
         if st == "render":
-            return (self.state["assemble"],)
+            return (self.state["assemble"], job)
         raise KeyError(st)
 
     def _stage_done(self, st, ok, payload):
@@ -286,9 +347,30 @@ class PipelinePanel(QWidget):
         self._busy = False
         self._worker = None
         self.bar.hide()
+        self.btn_pause.setEnabled(False)
         if not ok:
-            self._set_status(st, "FAIL: %s" % str(res)[:120])
-            self.log.emit("Stage %s fail: %s" % (st, res))
+            # M7: JobPaused is NOT a failure — paused UI + Resume button.
+            if isinstance(res, JobPaused):
+                summ = (self._job.job_summary().get(st, {})
+                        if self._job else {})
+                prog = (" (%d/%d)" % (summ.get("done", 0), summ.get("total", 0))
+                        if summ.get("total") else "")
+                self._set_status(st, "⏸ Paused%s: %s" % (prog, res.user_message[:100]))
+                self.log.emit("PAUSED (%s): %s" % (st, res.user_message))
+                if res.resume_hint:
+                    self.log.emit("HAL: %s" % res.resume_hint)
+                self._refresh_buttons()  # Start button becomes "Resume"
+                return
+            err_txt = str(res)[:150]
+            # M7: show the classified category + what-to-do from the manifest.
+            extra = ""
+            if self._job is not None:
+                serr = self._job.stage_error(st) or {}
+                if serr.get("category"):
+                    extra = " [%s] %s" % (serr["category"],
+                                          serr.get("what_to_do", ""))
+            self._set_status(st, "FAIL: %s%s" % (err_txt[:120], extra[:120]))
+            self.log.emit("Stage %s fail: %s %s" % (st, err_txt, extra))
             self._refresh_buttons()
             return
         self.state[st] = res
@@ -323,13 +405,15 @@ class PipelinePanel(QWidget):
         return True
 
     # -- stages (run on the WORKER thread; args are plain snapshots) ----------
-    def _stage_voiceover(self, tick, script, tone, work):
+    def _stage_voiceover(self, tick, script, tone, work, job, pause_event):
         from . import voiceover_studio as vsm
         tick("Voiceover ban rahi hai…")
         ok, res = vsm.generate_voiceover(
             script, tone, work,
-            progress_cb=lambda ph, d, t, m: tick(m))
+            progress_cb=lambda ph, d, t, m: tick(m),
+            job=job, pause_event=pause_event)
         if not ok:
+            raise_if_paused(job)   # paused -> JobPaused (manifest updated)
             raise RuntimeError(res)
         mp3, chunks = res
         return {"mp3": mp3, "chunks": chunks}
@@ -342,33 +426,63 @@ class PipelinePanel(QWidget):
         tick("%d exact slots." % len(slots))
         return slots
 
-    def _stage_reference(self, tick, brief, work):
+    def _stage_reference(self, tick, brief, work, job, pause_event):
         media = os.path.join(work, "media")
         os.makedirs(media, exist_ok=True)
         ref = os.path.join(media, "reference_sheet.png")
+        # M7: resume — finished reference is reused, never regenerated.
+        if job.is_stage_done("reference") and os.path.exists(ref):
+            tick("Reference sheet pehle se tayar.")
+            return ref
+        if pause_event.is_set():
+            raise JobPaused("User ne pause kiya.", "Resume dabao.")
+        job.start_stage("reference")
         tick("Reference sheet ban rahi hai…")
         ok, res = ai_helper.generate_reference_sheet(brief or "epic warrior", ref)
         if not ok:
+            if record_stage_error(job, "reference", AIError(res)) == "paused":
+                raise JobPaused(job.pause_reason, job.pause_hint)
             raise RuntimeError(res)
+        job.checkpoint("reference", {"path": ref})
+        job.complete_stage("reference")
         return ref
 
-    def _stage_photos(self, tick, slots, reference, work):
+    def _stage_photos(self, tick, slots, reference, work, job, pause_event):
         media = os.path.join(work, "media")
         os.makedirs(media, exist_ok=True)
+        if not job.is_stage_done("photos"):
+            job.start_stage("photos")   # preserves checkpoint (resume-safe)
+        job.set_total("photos", len(slots))
         photos = []
         for i, s in enumerate(slots):
-            tick("Photo %d/%d…" % (i + 1, len(slots)))
-            ok, prompt = ai_helper.suggest_visual_prompt(s["label"])
-            prompt = prompt if ok else s["label"]
+            if pause_event.is_set():
+                raise JobPaused("User ne pause kiya.",
+                                "Resume dabao — baqi photos wahin se banengi.")
+            unit = "slot_%03d" % (i + 1)
             img = os.path.join(media, "slot_%03d.png" % (i + 1))
-            ok, res = ai_helper.generate_image(prompt, img,
-                                               reference_image_path=reference or None)
-            if not ok:
-                raise RuntimeError("Photo %d: %s" % (i + 1, res))
+            # M7: completed unit + file on disk -> reuse, no API call.
+            done_already = job.is_unit_done("photos", unit) and os.path.exists(img)
+            if done_already:
+                prompt = (job.unit_extra("photos", unit) or {}).get("prompt") \
+                    or s["label"]
+                tick("Photo %d/%d (pehle se tayar)…" % (i + 1, len(slots)))
+            else:
+                tick("Photo %d/%d…" % (i + 1, len(slots)))
+                ok, prompt = ai_helper.suggest_visual_prompt(s["label"])
+                prompt = prompt if ok else s["label"]
+                ok, res = ai_helper.generate_image(
+                    prompt, img, reference_image_path=reference or None)
+                if not ok:
+                    if record_stage_error(job, "photos", AIError(res)) == "paused":
+                        raise JobPaused(job.pause_reason, job.pause_hint)
+                    raise RuntimeError("Photo %d: %s" % (i + 1, res))
+                job.mark_unit_done("photos", unit, {"path": img, "prompt": prompt})
             photos.append({"path": img, "prompt": prompt})
+        job.complete_stage("photos")
         return photos
 
-    def _stage_assemble(self, tick, script, tone, voiceover, slots, photos):
+    def _stage_assemble(self, tick, script, tone, voiceover, slots, photos, job):
+        job.start_stage("assemble")
         project = Project("Auto (%s)" % tone)
         project.tracks["narration"].media_path = os.path.abspath(voiceover["mp3"])
         for i, (s, ph) in enumerate(zip(slots, photos)):
@@ -379,10 +493,13 @@ class PipelinePanel(QWidget):
         sfx_dir = os.path.normpath(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "..", "assets", "sfx"))
         n = auto_place_sfx(project, script, sfx_dir)
+        job.checkpoint("assemble", {"slots": len(slots)})
+        job.complete_stage("assemble")
         tick("Assemble ho gaya (%d SFX)." % n)
         return project
 
-    def _stage_render(self, tick, project):
+    def _stage_render(self, tick, project, job):
+        job.start_stage("render")   # app marks done/failed on render finish
         self.render_asked.emit(project)
         return True
 
@@ -398,6 +515,7 @@ class PipelinePanel(QWidget):
         self._run_seq += 1
         seq = self._run_seq
         self._set_all_buttons_enabled(False)
+        self.btn_pause.setEnabled(False)  # preview is one shot, not pausable
         self._set_status("voiceover", "Preview ban raha hai…")
 
         def fn(tick):

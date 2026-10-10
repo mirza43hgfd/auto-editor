@@ -1,6 +1,20 @@
-"""Local app settings. The Gemini API key is stored obfuscated (XOR + base64),
-never plaintext, and is NEVER written to logs. This is the user's own key on
-their own PC."""
+"""Local app settings.
+
+API key storage (M2):
+  - On Windows: DPAPI (win32crypt.CryptProtectData, user scope) — the OS-held
+    key encrypts the blob; only the same Windows user can decrypt it. This is
+    real encryption, not obfuscation. Requires pywin32 (bundled in the EXE
+    build); if win32crypt is unavailable it falls back to the obfuscated
+    store below and documents that in the key_status readout.
+  - Elsewhere (Linux/macOS dev): the existing obfuscated store (XOR with app
+    salt + base64) — keeps the key out of casual plaintext view, NOT
+    encryption. Documented honestly as such.
+  - Format is backward compatible: DPAPI blobs are stored as
+    "DPAPI1:<base64>", legacy blobs decode as before, so keys saved by older
+    versions keep working.
+
+The key is NEVER written to logs. This is the user's own key on their own PC.
+"""
 
 import base64
 import json
@@ -27,6 +41,39 @@ def _config_path():
     return os.path.join(_config_dir(), "config.json")
 
 
+def _dpapi():
+    """win32crypt module or None. Guarded: import only on Windows."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import win32crypt
+        return win32crypt
+    except ImportError:
+        return None
+
+
+def dpapi_available():
+    """True when OS-backed (DPAPI) key storage can be used right now."""
+    return _dpapi() is not None
+
+
+def key_storage_backend():
+    """'DPAPI' on Windows with pywin32, else 'obfuscated' (honest label for UI)."""
+    return "DPAPI" if dpapi_available() else "obfuscated"
+
+
+def _dpapi_protect(data: bytes) -> bytes:
+    crypt = _dpapi()
+    # user scope (default): only this Windows user can decrypt — the right
+    # scope for "the user's own key on their own PC".
+    return crypt.CryptProtectData(data, None, None, None, None, 0)[1]
+
+
+def _dpapi_unprotect(blob: bytes) -> bytes:
+    crypt = _dpapi()
+    return crypt.CryptUnprotectData(blob, None, None, None, None, 0)[1]
+
+
 def _load_all():
     try:
         with open(_config_path(), "r", encoding="utf-8") as f:
@@ -44,11 +91,22 @@ def _save_all(data):
 
 
 def _encode_key(key: str) -> str:
-    return base64.b64encode(_xor(key.encode("utf-8"))).decode("ascii")
+    raw = key.encode("utf-8")
+    if _dpapi() is not None:
+        try:
+            return "DPAPI1:" + base64.b64encode(_dpapi_protect(raw)).decode("ascii")
+        except Exception:
+            pass  # fall through to obfuscated store
+    return base64.b64encode(_xor(raw)).decode("ascii")
 
 
 def _decode_key(blob: str) -> str:
     try:
+        if blob.startswith("DPAPI1:"):
+            crypt = _dpapi()
+            if crypt is None:
+                return ""  # DPAPI blob on a non-DPAPI machine: cannot decrypt
+            return _dpapi_unprotect(base64.b64decode(blob[7:].encode("ascii"))).decode("utf-8")
         return _xor(base64.b64decode(blob.encode("ascii"))).decode("utf-8")
     except (ValueError, UnicodeDecodeError):
         return ""

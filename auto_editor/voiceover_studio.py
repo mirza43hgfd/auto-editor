@@ -32,6 +32,7 @@ import wave
 
 from . import ai_helper
 from .ai_helper import AIError
+from .jobs import JobPaused, record_stage_error
 
 TONES = {
     "Deep Dramatic": {
@@ -185,31 +186,60 @@ def preview_chunk(script_text, tone_name, work_dir, api_key=None):
 
 
 def generate_voiceover(script_text, tone_name, work_dir, progress_cb=None,
-                       api_key=None, ffmpeg="ffmpeg"):
+                       api_key=None, ffmpeg="ffmpeg", job=None,
+                       pause_event=None):
     """Full voiceover: chunks -> TTS -> concat MP3.
 
     Returns (ok, (mp3_path, chunks) | error) where
       chunks[i] = {"text": str, "start": float_sec, "end": float_sec}
     Starts are cumulative sums of the exact per-chunk durations, so slots
     built from chunks need no transcription.
+
+    M7 job support: with job (a jobs.JobStore) every finished chunk is
+    checkpointed and completed chunks are skipped on resume (the wav must
+    still exist). pause_event (threading.Event) is checked between chunks
+    and raises jobs.JobPaused. Failures are classified + recorded in the
+    manifest via record_stage_error and still returned as (False, msg) —
+    the caller escalates with jobs.raise_if_paused().
     """
     chunks = split_script(script_text)
     if not chunks:
         return False, "Script khaali hai."
     os.makedirs(work_dir, exist_ok=True)
+    if job is not None:
+        job.start_stage("voiceover")   # preserves checkpoint (resume-safe)
+        job.set_total("voiceover", len(chunks))
     wavs, durations = [], []
     for i, ch in enumerate(chunks):
+        unit = "chunk_%03d" % i
+        out = os.path.join(work_dir, "vo_chunk_%03d.wav" % i)
+        if pause_event is not None and pause_event.is_set():
+            raise JobPaused("User ne pause kiya.",
+                            "Resume dabao — voiceover wahin se shuru hogi.")
+        if job is not None and job.is_unit_done("voiceover", unit) \
+                and os.path.exists(out):
+            if progress_cb:
+                progress_cb("tts", i, len(chunks),
+                            "Chunk %d/%d (pehle se tayar)..." % (i + 1, len(chunks)))
+            wavs.append(out)
+            durations.append(chunk_duration(out, ffmpeg))
+            continue
         if progress_cb:
             progress_cb("tts", i, len(chunks), "Chunk %d/%d..." % (i + 1, len(chunks)))
-        out = os.path.join(work_dir, "vo_chunk_%03d.wav" % i)
         ok, res = synthesize_chunk(ch, tone_name, out, api_key)
         if not ok:
+            if job is not None:
+                record_stage_error(job, "voiceover", AIError(res))
             return False, res
+        if job is not None:
+            job.mark_unit_done("voiceover", unit, {"wav": out})
         wavs.append(out)
         durations.append(chunk_duration(out, ffmpeg))
     mp3 = os.path.join(work_dir, "voiceover_final.mp3")
     ok, res = concat_chunks(wavs, mp3, ffmpeg)
     if not ok:
+        if job is not None:
+            record_stage_error(job, "voiceover", AIError("Concat fail: %s" % res))
         return False, "Concat fail: %s" % res
     if progress_cb:
         progress_cb("tts", len(chunks), len(chunks), "Voiceover tayar.")
@@ -217,4 +247,7 @@ def generate_voiceover(script_text, tone_name, work_dir, progress_cb=None,
     for ch, dur in zip(chunks, durations):
         timed.append({"text": ch, "start": t, "end": t + dur})
         t += dur
+    if job is not None:
+        job.checkpoint("voiceover", {"mp3": mp3, "chunks": timed})
+        job.complete_stage("voiceover")
     return True, (mp3, timed)

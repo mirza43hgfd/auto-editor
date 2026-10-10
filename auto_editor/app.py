@@ -1,8 +1,11 @@
-"""Auto-Editor Phase 1 — PySide6 main window.
+"""Auto-Editor — PySide6 main window.
 
-Dark premium UI (assets/premium.qss). Media bin with drag-drop, slot table
-(graphical timeline arrives in Phase 2), embedded browser, settings with the
-API key pool, full-auto pipeline entry, background render with progress.
+Dark premium UI (assets/premium.qss). Two views:
+  Workspace (M3, primary) — editing-first: storyboard, preview monitor,
+    properties inspector, multitrack timeline with undo/redo.
+  Classic — Phase 1 layout: media bin, pipeline panel, slot table, render bar.
+Media bin with drag-drop, embedded browser, settings with the API key pool,
+full-auto pipeline entry, background render with progress.
 """
 
 import os
@@ -24,6 +27,7 @@ from .media import import_files, scan_watch_folder, export_slot_prompts
 from .render_worker import render_project, RenderCancelled
 from . import ai_helper
 from .pipeline_panel import PipelinePanel
+from .workspace import MainWorkspace
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ASSETS = os.path.normpath(os.path.join(HERE, "..", "assets"))
@@ -159,6 +163,42 @@ class MainWindow(QMainWindow):
         self._autosave.timeout.connect(self._auto_save)
         self._autosave.start(120_000)
 
+        # M7: crash recovery — offer Resume for unfinished jobs (never auto-start).
+        QTimer.singleShot(800, self._check_job_recovery)
+
+    # -- M7 job recovery ------------------------------------------------------
+    def _check_job_recovery(self):
+        """Scan recent work dirs for unfinished job manifests; offer Resume."""
+        try:
+            from . import jobs
+            dirs = settings_store.get("recent_work_dirs", []) or []
+            dirs = [d for d in dirs if d and os.path.isdir(d)]
+            found = jobs.scan_incomplete(dirs)
+        except Exception:
+            return
+        if not found:
+            return
+        lines = []
+        for f in found[:5]:
+            s = f["summary"]
+            done = sum(1 for v in s.values() if v["status"] == "done")
+            stale = " [stale — lagta hai app crash hui thi]" if f["stale"] else ""
+            lines.append("• %s\n    %s — %d/%d stages%s"
+                         % (f["work_dir"], f["job_status"], done, len(s), stale))
+        box = QMessageBox(self)
+        box.setWindowTitle("Adhoora kaam mila")
+        box.setText("Pichli dafa ye kaam adhoora reh gaya tha:\n\n"
+                    + "\n".join(lines)
+                    + "\n\nResume karna hai? (khud start nahi hoga — "
+                      "tum Pipeline me 'Resume' dabaoge)")
+        btn_resume = box.addButton("Resume", QMessageBox.AcceptRole)
+        box.addButton("Baad me", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() == btn_resume:
+            self.pipeline.work_edit.setText(found[0]["work_dir"])
+            self._log("Recovery: work folder set — Pipeline tab me stage ka "
+                      "'Resume' dabao; progress manifest se wapas ayegi.")
+
     # -- UI ---------------------------------------------------------------
     def _load_theme(self):
         qss = os.path.join(ASSETS, "premium.qss")
@@ -171,9 +211,23 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         lay = QVBoxLayout(central)
 
-        title = QLabel("Auto-Editor <span style='color:#c9a227'>Phase 1</span>")
+        title = QLabel("Auto-Editor <span style='color:#c9a227'>workspace</span>")
         title.setObjectName("heading")
         lay.addWidget(title)
+
+        self.view_tabs = QTabWidget()
+        lay.addWidget(self.view_tabs, 1)
+
+        # M3 editing workspace — the primary view
+        self.workspace = MainWorkspace()
+        self.workspace.project_changed.connect(self._workspace_changed)
+        self.workspace.set_project(self.project)
+        self.view_tabs.addTab(self.workspace, "Workspace")
+
+        # Classic view — Phase 1 layout, kept fully working
+        classic = QWidget()
+        clay = QVBoxLayout(classic)
+        clay.setContentsMargins(0, 0, 0, 0)
 
         split = QSplitter(Qt.Orientation.Horizontal)
 
@@ -247,8 +301,14 @@ class MainWindow(QMainWindow):
         rl.addWidget(self.log)
         split.addWidget(right)
         split.setSizes([320, 960])
-        lay.addWidget(split, 1)
+        clay.addWidget(split, 1)
+        self.view_tabs.addTab(classic, "Classic")
         self.statusBar().showMessage("Ready")
+
+    def _workspace_changed(self):
+        # a workspace edit mutated self.project in place — keep the
+        # classic slot table in sync (rebind is a no-op for same object).
+        self._refresh_table()
 
     def _build_menus(self):
         mb = self.menuBar()
@@ -315,6 +375,9 @@ class MainWindow(QMainWindow):
                     s.visual_type, s.motion_preset]
             for c, v in enumerate(vals):
                 self.table.setItem(r, c, QTableWidgetItem(v))
+        # keep the workspace bound to the current project object
+        # (_new/_open/pipeline replace it; workspace edits mutate in place)
+        self.workspace.set_project(self.project)
 
     def _add_slot(self):
         start, ok = QInputDialog.getDouble(self, "Slot", "Start (sec):", 0, 0, 99999, 1)
@@ -457,6 +520,15 @@ class MainWindow(QMainWindow):
         self.project = project
         self._refresh_table()
         base = os.path.dirname(self.project_path) if self.project_path else os.getcwd()
+        # M7: the pipeline manifest already has render=running (panel stage);
+        # a direct main-window render also records it when a work dir is known.
+        try:
+            from .jobs import JobStore
+            w = self.pipeline.work_edit.text().strip()
+            if w and os.path.isdir(w):
+                JobStore(w).start_stage("render")
+        except Exception:
+            pass
         self._render(out_path=os.path.join(base, "final.mp4"))
 
     # -- render -------------------------------------------------------------------
@@ -500,12 +572,36 @@ class MainWindow(QMainWindow):
         self.btn_cancel.setEnabled(False)
         self.prog.setValue(100)
         self._log("DONE: " + path)
+        # M7: render stage complete in the pipeline manifest (if any).
+        try:
+            from .jobs import JobStore
+            w = self.pipeline.work_edit.text().strip()
+            if w and os.path.isdir(w):
+                JobStore(w).complete_stage("render")
+        except Exception:
+            pass
         QDesktopServices.openUrl(QUrl.fromLocalFile(os.path.dirname(path)))
 
     def _on_fail(self, msg):
         self.btn_render.setEnabled(True)
         self.btn_cancel.setEnabled(False)
         self._log("RENDER FAIL:\n" + msg)
+        # M7: user-cancelled render -> paused (chunks are resume-safe);
+        # real render errors -> failed with the message.
+        try:
+            from .jobs import JobStore
+            w = self.pipeline.work_edit.text().strip()
+            if w and os.path.isdir(w):
+                store = JobStore(w)
+                if "cancel" in msg.lower():
+                    store.pause_job("Render cancel kiya gaya.",
+                                    "Render dobara chalao — chunks resume-safe hain.")
+                else:
+                    store.fail_stage("render", "transient", str(msg)[:300],
+                                     "Render dobara chalao — chunks wahin se resume honge.",
+                                     retryable=True)
+        except Exception:
+            pass
 
     def _log(self, msg):
         self.log.append(msg)

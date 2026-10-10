@@ -5,19 +5,22 @@ quota). The key is sent ONLY as the x-goog-api-key header to
 generativelanguage.googleapis.com and is NEVER logged, printed, or included
 in error messages.
 
-call_gemini() is THE primitive (text in, text out, optional inline media);
-every helper below builds on it, so key-pool failover and model fallback
-live in one place.
+Key-pool failover, backoff and error taxonomy now live in provider.py
+(Provider / KeyRing); this module keeps the public function names and routes
+through it. Prompt/response caching lives in cache.py and is consulted by
+call_gemini() and generate_image() so identical requests never burn quota
+twice.
 """
 
 import base64
 import json
 import os
-import urllib.request
 
 from . import settings_store
+from . import provider as _provider_mod
+from .cache import PromptCache
 
-API_HOST = "https://generativelanguage.googleapis.com"
+API_HOST = _provider_mod.API_HOST
 TEXT_MODEL = "gemini-3.5-flash"          # verified working via generateContent
 TEXT_MODEL_FALLBACK = "gemini-flash-latest"
 IMAGE_MODEL = "gemini-2.5-flash-image"   # listed in models:list for this key
@@ -37,79 +40,76 @@ class AIError(Exception):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Prompt cache (process-wide singleton; tests isolate via configure_cache).
+# ---------------------------------------------------------------------------
+_cache = None
+
+
+def configure_cache(path):
+    """Point the cache at a specific SQLite file (tests use a temp dir)."""
+    global _cache
+    if _cache is not None:
+        _cache.close()
+    _cache = PromptCache(path)
+
+
+def _get_cache():
+    global _cache
+    if _cache is None:
+        _cache = PromptCache()
+    return _cache
+
+
+# ---------------------------------------------------------------------------
+# Transport shims — kept (and stub-able) for voiceover_studio + tests.
+# ---------------------------------------------------------------------------
 def _post_single(model, payload, api_key, timeout=90):
     """Low-level generateContent POST with one explicit key.
 
     Raises AIError (key never in the message). Returns (response, http_code).
     """
-    url = "%s/v1beta/models/%s:generateContent" % (API_HOST, model)
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=body,
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.load(resp), 200
-    except urllib.error.HTTPError as e:
-        try:
-            detail = e.read(300).decode("utf-8", "replace")
-        except Exception:
-            detail = ""
-        raise AIError("HTTP_%d %s" % (e.code, detail[:200]))
+        return _provider_mod.default_transport(model, payload, api_key,
+                                               timeout), 200
+    except _provider_mod.HTTPStatusError as e:
+        raise AIError(str(e))
 
 
-# HTTP codes / phrases that mean "try the next key", not "give up".
-_FAILOVER_CODES = {429, 500, 502, 503}
-_FAILOVER_WORDS = ("quota", "rate limit", "rate_limit", "exhausted", "too many requests")
+def _pool_transport(model, payload, api_key, timeout=90):
+    """Provider transport delegating to the module-global _post_single.
+
+    Looks _post_single up at call time so tests can stub it (as
+    test_integration does) while the real error taxonomy lives in provider.
+    """
+    try:
+        resp, _ = _post_single(model, payload, api_key, timeout=timeout)
+        return resp
+    except AIError as e:
+        raise _provider_mod.http_status_from_ai_error(e)
 
 
 def _post_pool(model, payload, timeout=90):
-    """POST using the key pool with auto-failover.
+    """POST using the key ring with auto-failover (see provider.py).
 
-    Tries usable keys in slot order; a key that hits quota/rate/transient
-    errors is marked limited (cooldown) and the next key is tried.
-    Raises AIError when every key is exhausted.
+    Raises AIError when every key is exhausted (Roman Urdu message, pause
+    friendly). Never touches the network when no key is configured.
     """
-    slots = settings_store.get_api_key_slots()
-    order = settings_store.usable_key_indices()
-    # also retry keys that are merely cooling down, as a last resort
-    import time
-    now = time.time()
-    for i, k in enumerate(slots):
-        if k and i not in order:
-            st = settings_store.get_key_status(i)
-            if st["status"] != settings_store.STATUS_FAILED:
-                order.append(i)
-    if not order:
-        raise AIError("Koi API key nahi mili. Settings me key dalo.")
-
-    last_err = None
-    for i in order:
-        key = slots[i]
-        try:
-            resp, _ = _post_single(model, payload, key, timeout)
-            settings_store.set_key_status(i, settings_store.STATUS_OK)
-            return resp
-        except AIError as e:
-            msg = str(e)
-            code = None
-            if msg.startswith("HTTP_"):
-                try:
-                    code = int(msg[5:8])
-                except ValueError:
-                    pass
-            low = msg.lower()
-            failover = (code in _FAILOVER_CODES) or any(w in low for w in _FAILOVER_WORDS)
-            if code == 403 or "api key" in low or "invalid" in low:
-                settings_store.set_key_status(i, settings_store.STATUS_FAILED)
-            elif failover:
-                settings_store.set_key_status(i, settings_store.STATUS_LIMITED,
-                                              settings_store.COOLDOWN_SEC)
-            last_err = e
-            continue
-    raise AIError("Sari keys limit par hain, thori der baad try karo ya nayi key dalo. (%s)"
-                  % str(last_err)[:120])
+    ring = _provider_mod.Provider.from_settings(settings_store,
+                                                transport=_pool_transport)
+    try:
+        return ring.post(model, payload, op="text", timeout=timeout)
+    except _provider_mod.AllKeysExhausted as e:
+        # M7: keep the pause signal machine-readable — jobs.classify_error
+        # also sniffs the message text (callers stringify AIError), but the
+        # attributes survive for direct _post_pool users.
+        err = AIError(e.user_message)
+        err.paused = True
+        err.resume_hint = e.resume_hint
+        err.error_category = e.last_error_category
+        raise err
+    except _provider_mod.ProviderError as e:
+        raise AIError(str(e))
 
 
 def _text_of(response):
@@ -164,21 +164,35 @@ def _post_model_pool(model, payload, api_key=None, timeout=90):
 
 
 def call_gemini(prompt, system=None, model=None, media_paths=None,
-                api_key=None, timeout=90):
+                api_key=None, timeout=90, use_cache=True):
     """THE primitive: text in, text out.
 
     prompt: main instruction text. system: optional system instruction.
     model: explicit model id, or None -> TEXT_MODEL with fallback.
     media_paths: list of local image/audio files sent as inline_data.
+    use_cache: identical (model, prompt, system, media) served from the
+        SQLite prompt cache without touching the network. Explicit api_key
+        bypasses the cache (caller's key, caller's responsibility).
     Raises AIError on failure (key never in the message). Never logs the key.
     """
     models = (model,) if model else (TEXT_MODEL, TEXT_MODEL_FALLBACK)
     payload = _payload(prompt, media_paths=media_paths, system=system)
+    cache = _get_cache() if (use_cache and not api_key) else None
     last_err = None
     for m in models:
+        ckey = None
+        if cache is not None:
+            ckey = cache.key(m, prompt or "", {"system": system},
+                             media_paths)
+            hit = cache.get_text_by_key(ckey)
+            if hit is not None:
+                return hit
         try:
             resp = _post_model_pool(m, payload, api_key=api_key, timeout=timeout)
-            return _text_of(resp)
+            text = _text_of(resp)
+            if cache is not None and ckey:
+                cache.put_text_by_key(ckey, text)
+            return text
         except AIError as e:
             last_err = e
     raise last_err
@@ -274,23 +288,33 @@ def transcribe_audio(mp3_path, api_key=None):
         return False, str(e)
 
 
-def generate_image(prompt, out_path, api_key=None, reference_image_path=None):
+def generate_image(prompt, out_path, api_key=None, reference_image_path=None,
+                   use_cache=True):
     """Prompt -> 16:9 PNG via Gemini image model.
 
     reference_image_path: optional character reference sheet — passed as a
     multimodal input so the character stays consistent across photos.
     Honest limit: consistency improves a lot, but is not 100% guaranteed.
+    use_cache: identical (prompt, reference) served from cache, no new call.
     """
     if reference_image_path and os.path.exists(reference_image_path):
         media = [reference_image_path]
     else:
         media = []
+    full_prompt = ("16:9 widescreen cinematic still, photorealistic, no text in image. "
+                   + ("Match the character look from the reference image. "
+                      if reference_image_path else "")
+                   + prompt[:2000])
+    cache = _get_cache() if (use_cache and not api_key) else None
+    params = {"reference": bool(reference_image_path)}
+    if cache is not None:
+        hit = cache.get_bytes(IMAGE_MODEL, full_prompt, params, media)
+        if hit is not None:
+            with open(out_path, "wb") as f:
+                f.write(hit)
+            return True, out_path
     payload = _payload(
-        ("16:9 widescreen cinematic still, photorealistic, no text in image. "
-         + ("Match the character look from the reference image. "
-            if reference_image_path else "")
-         + prompt[:2000]),
-        media_paths=media,
+        full_prompt, media_paths=media,
         generation_config={"responseModalities": ["TEXT", "IMAGE"]})
     try:
         resp = _post_model_pool(IMAGE_MODEL, payload, api_key=api_key, timeout=240)
@@ -298,8 +322,11 @@ def generate_image(prompt, out_path, api_key=None, reference_image_path=None):
         for p in rparts:
             inline = p.get("inlineData") or p.get("inline_data")
             if inline and inline.get("data"):
+                raw = base64.b64decode(inline["data"])
+                if cache is not None:
+                    cache.put_bytes(IMAGE_MODEL, full_prompt, raw, params, media)
                 with open(out_path, "wb") as f:
-                    f.write(base64.b64decode(inline["data"]))
+                    f.write(raw)
                 return True, out_path
         return False, "Model returned no image data."
     except AIError as e:
