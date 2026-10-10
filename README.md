@@ -1,7 +1,8 @@
-# Auto-Editor — Phase 1
+# AutoEditor v2.0
 
-Desktop documentary assembler (PySide6, Python 3.12, Windows 10 target).
-Two ways to work: **manual timeline** or **script-first auto pipeline**.
+Premium Windows desktop AI video editor (PySide6, Python 3.12, Windows 10 target).
+Three ways to work: **editing workspace** (preview monitor, storyboard, multitrack
+timeline, inspector), **manual timeline**, or **script-first auto pipeline**.
 
 ## Run (development)
 
@@ -31,7 +32,9 @@ reference sheet for consistency (big improvement, not 100% guaranteed).
 ## Manual mode
 
 - Media bin: drag-drop MP3/WAV (narration), JPG/PNG (photos), MP4 (clips), logo.
-- Slot table: each slot = 1 visual on a narration line (graphical timeline = Phase 2).
+- Slot table: each slot = 1 visual on a narration line. Graphical multitrack
+  timeline widget (v2.0): drag to reorder, trim handles, per-slot transition
+  picker, playhead, undo/redo — see `auto_editor/timeline_widget.py`.
 - Watch folder: Flow-generated photos dropped here are auto-imported on scan.
 - Export slot prompts -> markdown with copy-paste visual prompts per slot.
 - Clip limits: project setting, max 30 clips / 600s total by default (photos unlimited);
@@ -68,7 +71,9 @@ dict directly (media_dir = project dir).
 - Transitions: `xfade` chains (1s); each non-final segment is extended by the
   fade duration so the wall-clock timeline never shrinks and every transition
   starts exactly on a slot boundary. `cut` breaks the chain (joined safely via
-  the concat filter); `fadeblack` currently renders as crossfade (Phase 2).
+  the concat filter). `dip-to-black` / `fadeblack` genuinely fades out to black
+  and back in (v2.0). `fade-in` / `fade-out` supported. The renderer implements
+  the transition stored on the slot — never a silent substitute.
 - Chunks are encoded with closed GOPs (`open-gop=0`) so the final demuxer
   concat (`-c copy`) is safe; intra-chunk joins use the concat filter.
 - Grade presets: none / cinematic / teal-orange / war-desat / night-cold
@@ -81,25 +86,35 @@ dict directly (media_dir = project dir).
 
 ## Settings
 
-- Gemini API key **pool** (up to 7 slots). Auto-failover: on 429/quota/5xx the key
-  is cooled down (10 min) and the next key is tried. Status dots: green ok /
-  orange limited / red failed. Keys are obfuscated in local config, never logged.
-- All AI calls use the user's own key(s) — their quota. The app itself works
-  offline except AI features and the embedded browser.
+- Gemini API key **ring** (up to 7 slots, centralized in `provider.py`).
+  Per-key state: enabled/disabled, validation, recent success/failure, rate-limit
+  status, Retry-After, last error category. Failover: on 429 the key is marked
+  cooling-down (Retry-After honored) and the next eligible key is tried; on
+  401/403 the key is marked invalid and the user is told. Keys may share the
+  same account quota — the tool never assumes switching keys adds quota and
+  never rotates keys to evade limits. Status dots: green ok / orange limited /
+  red failed. Keys are obfuscated in local config, never logged.
+- Token-bucket throttling per model, SQLite prompt cache (identical prompts are
+  never re-sent), TTS chunk batching. All AI calls use the user's own key(s) —
+  their quota. The app itself works offline except AI features and the embedded
+  browser.
 - Embedded browser: QtWebEngine with persistent profile (`browser_profile/`) —
   log in once (Google/Flow), session persists.
 
-## AI calls (Phase 1)
+## AI calls (v2.0 provider layer)
+
+All AI traffic goes through `auto_editor/provider.py` (one abstraction for text,
+image and audio) with the key-ring, token bucket, backoff+jitter and cache:
 
 - `suggest_slot_splits(script)` -> JSON slot boundaries
 - `suggest_visual_prompt(description)` -> image prompt
-- `transcribe_audio(mp3)` -> transcript (<=15MB inline; chunked = Phase 2)
+- `transcribe_audio(mp3)` -> transcript (chunked for large files)
 - `generate_reference_sheet(brief)` -> character board PNG
 - `generate_image(prompt, ref)` -> 16:9 PNG, reference as multimodal input
 - `synthesize_chunk(text, tone)` -> WAV via Gemini TTS (voice + style direction)
 
-Phase 2: title/description/tags generator, pacing tips, graphical timeline,
-dip-to-black, 4K, render queue, 9:16 vertical, SEO export, thumbnail grabber.
+Future (not yet built): title/description/tags generator, pacing tips, 4K output
+profile, 9:16 vertical preset, render queue UI, SEO export, thumbnail grabber.
 
 ## Test
 
