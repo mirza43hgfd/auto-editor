@@ -75,6 +75,16 @@ jobs:
         run: |
           python -m auto_editor.smoke
 
+      - name: Smoke test (Qt module imports)
+        # v2.0 shipped an ImportError (pipeline_panel importing the deleted
+        # MOTION_CYCLE) because nothing ever imported the Qt-bearing modules.
+        # This runs on windows-latest where PySide6's bundled Qt works;
+        # QT_QPA_PLATFORM=offscreen means no display is needed (imports only,
+        # no widgets constructed). Would have caught the v2.0 crash.
+        shell: bash
+        run: |
+          python -m auto_editor.smoke_gui
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
